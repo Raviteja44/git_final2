@@ -4,102 +4,98 @@ on:
   workflow_dispatch:
     inputs:
       feature_branch:
-        description: 'Feature branch name (e.g. feature/edp_changes_ravi)'
+        description: "Feature branch name (example: feature/edp_changes_ravi)"
         required: true
-        type: string
-      enable_auto_merge:
-        description: 'Enable auto-merge when approvals satisfied? (true/false)'
-        required: false
-        default: 'true'
         type: string
 
 permissions:
-  contents: write       # for creating refs, comparing commits
-  pull-requests: write  # for creating PRs and enabling auto-merge
+  contents: write
+  pull-requests: write
 
 jobs:
   promote:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Setup node (for github-script)
+      - name: Setup node
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: "18"
 
-      - name: Create PR from feature → dev (compare and include file list)
+      - name: Validate inputs and create PR
         uses: actions/github-script@v6
-        id: create_pr
         with:
           script: |
             const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const feature = core.getInput('feature_branch');
-            const base = 'dev';
-            const enableAuto = core.getInput('enable_auto_merge') === 'true';
+            const repo  = context.repo.repo;
 
-            // 1) Compare dev...feature to get changed files & commit messages
+            // Read workflow_dispatch input properly
+            const feature = context.payload.inputs.feature_branch;
+            const base = "dev";
+
+            // Validate input
+            if (!feature || feature.trim() === "") {
+              core.setFailed("ERROR: Input 'feature_branch' is empty.");
+              return;
+            }
+
+            // Validate that branch exists
+            try {
+              await github.rest.repos.getBranch({ owner, repo, branch: feature });
+            } catch (err) {
+              core.setFailed(`ERROR: Branch '${feature}' does not exist in the repository.`);
+              return;
+            }
+
+            // Compare feature vs dev
             const compare = await github.rest.repos.compareCommits({
               owner, repo,
               base: base,
               head: feature
             });
 
-            if (compare.status === 'diverged' || compare.status === 'ahead' || compare.files?.length > 0) {
-              const files = compare.files || [];
-              const fileCount = files.length;
-              const fileNames = files.slice(0, 200).map(f => f.filename); // limit to 200 names
-              const commits = compare.commits || [];
-              const lastCommit = commits.length ? commits[commits.length - 1] : null;
-              const commitSha = lastCommit ? lastCommit.sha : '';
-              const commitMessages = commits.map(c => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0,7)})`).join('\n');
+            const files = compare.files || [];
+            const commits = compare.commits || [];
 
-              // PR title & body
-              const sanitizedFeature = feature.replace(/\//g, '_');
-              const title = `Promote ${feature} → ${base}`;
-              const body = [
-                `**PR created by workflow**`,
-                ``,
-                `**Source branch:** ${feature}`,
-                `**Target branch:** ${base}`,
-                `**Changes identified:** ${fileCount} files`,
-                ``,
-                `**Changed files (first 200 shown):**`,
-                fileNames.length ? fileNames.join('\n') : '(none)',
-                ``,
-                `**Commits in this change:**`,
-                commitMessages || '(none)',
-                ``,
-                `**Last commit SHA:** ${commitSha}`,
-                ``,
-                `**Notes:** This PR was created automatically by workflow \`feature-to-dev\`.`,
-              ].join('\n');
-
-              // Create PR
-              const pr = await github.rest.pulls.create({
-                owner, repo,
-                title,
-                head: feature,
-                base: base,
-                body,
-              });
-
-              core.setOutput('pr_number', pr.data.number);
-              core.setOutput('pr_url', pr.data.html_url);
-
-              // Optionally enable auto-merge (will only merge when branch protections satisfied)
-              if (enableAuto) {
-                try {
-                  await github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/enable-auto-merge', {
-                    owner, repo, pull_number: pr.data.number,
-                    mediaType: { previews: ['luke-cage-preview'] }, // auto-merge preview header historically used; kept safe
-                    merge_method: 'merge'
-                  });
-                  core.info('Auto-merge enabled on PR #' + pr.data.number);
-                } catch (err) {
-                  core.warning('Failed to enable auto-merge (this may be due to permissions or repo settings): ' + err.message);
-                }
-              }
-
-            } else {
-              core.setFailed(`No differences found between ${base} and ${feature}. Nothing to promote.`);
+            if (files.length === 0 && commits.length === 0) {
+              core.setFailed(`No differences found between '${base}' and '${feature}'.`);
+              return;
             }
+
+            const fileNames = files.slice(0, 200).map(f => f.filename);
+            const commitMessages = commits.map(
+              c => `- ${c.commit.message.split("\n")[0]} (${c.sha.substring(0,7)})`
+            ).join("\n");
+
+            const lastCommit = commits.length ? commits[commits.length - 1] : null;
+            const commitSha = lastCommit ? lastCommit.sha : "(none)";
+
+            const title = `Promote ${feature} → ${base}`;
+
+            const body = [
+              "**Automated Promotion PR**",
+              "",
+              `**Source branch:** ${feature}`,
+              `**Target branch:** ${base}`,
+              `**Changed files:** ${files.length}`,
+              "",
+              "### File list (first 200)",
+              fileNames.join("\n"),
+              "",
+              "### Commit messages",
+              commitMessages,
+              "",
+              `**Last commit SHA:** ${commitSha}`
+            ].join("\n");
+
+            // Create a PR
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              base,
+              head: feature,
+              title,
+              body
+            });
+
+            core.info(`Created PR #${pr.data.number}: ${pr.data.html_url}`);
