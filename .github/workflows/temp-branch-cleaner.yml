@@ -1,0 +1,45 @@
+name: 4. Cleanup Temp Promotion Branches
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"  
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Get all branches (first 100)
+        id: branches
+        run: |
+          REPO="${{ github.repository }}"
+          # get branches (first 100; for larger repos you can iterate with pagination)
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/$REPO/branches?per_page=100" > branches.json
+          jq -r '.[].name' branches.json | sort > all_branches.txt
+          echo "::set-output name=file::all_branches.txt"
+
+      - name: Delete promote-pr-* branches (but keep feature/* and protected)
+        run: |
+          REPO="${{ github.repository }}"
+          while read BR; do
+            if [[ "$BR" == promote-pr-* ]]; then
+              # safety: skip feature/* (shouldn't match) and major branches
+              if [[ "$BR" == "dev" ]] || [[ "$BR" == "uat" ]] || [[ "$BR" == "prod" ]]; then
+                echo "Skipping protected branch $BR"
+                continue
+              fi
+              echo "Deleting branch $BR"
+              # Delete the ref
+              curl -s -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "https://api.github.com/repos/$REPO/git/refs/heads/$BR" || echo "Could not delete $BR"
+            fi
+          done < all_branches.txt

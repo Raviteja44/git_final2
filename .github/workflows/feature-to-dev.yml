@@ -1,0 +1,112 @@
+name: 1. Feature → Dev (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        description: "Feature branch name (must start with 'feature/')"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup tools
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Validate feature branch input
+        id: validate
+        run: |
+          BR="${{ github.event.inputs.feature_branch }}"
+          if [[ "$BR" != feature/* ]]; then
+            echo "ERROR: feature_branch must start with 'feature/'. Got: $BR"
+            exit 1
+          fi
+          # verify remote branch exists
+          if ! git ls-remote --heads origin "$BR" | grep -q "refs/heads/"; then
+            echo "ERROR: Branch origin/$BR not found."
+            exit 1
+          fi
+          echo "branch=$BR" >> $GITHUB_OUTPUT
+
+      - name: Fetch branches
+        run: |
+          git fetch --no-tags --prune --depth=1 origin dev
+          git fetch --no-tags --prune --depth=1 origin "${{ steps.validate.outputs.branch }}"
+
+      - name: Check for diffs vs dev
+        id: diffcheck
+        run: |
+          BR="${{ steps.validate.outputs.branch }}"
+          # list changed files between origin/dev and feature branch
+          FILES=$(git diff --name-only origin/dev origin/"$BR")
+          if [ -z "$FILES" ]; then
+            echo "No differences found between origin/dev and origin/$BR"
+            exit 1
+          fi
+          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
+          echo "files=$FILES" > files.txt
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "files_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Get latest commit message(s) from feature branch
+        id: commits
+        run: |
+          BR="${{ steps.validate.outputs.branch }}"
+          # get last commit summary from branch
+          LAST_MSG=$(git log -1 --pretty=%B origin/"$BR")
+          # also capture list of commits (short) that make up the feature branch vs dev
+          COMMITS=$(git log --pretty=format:"%h %s" origin/dev..origin/"$BR")
+          echo "last_msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$LAST_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "commits<<'EOF'" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create PR (feature → dev)
+        id: createpr
+        run: |
+          BR="${{ steps.validate.outputs.branch }}"
+          TITLE="Promote ${BR} → dev"
+          BODY="Automated PR to promote ${BR} into dev."
+          PAYLOAD=$(jq -n --arg title "$TITLE" --arg head "$BR" --arg base "dev" --arg body "$BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+          RESP=$(curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "https://api.github.com/repos/${{ github.repository }}/pulls")
+          echo "$RESP" > create_resp.json
+          NUMBER=$(jq -r .number create_resp.json)
+          if [ "$NUMBER" = "null" ] || [ -z "$NUMBER" ]; then
+            echo "Failed to create PR: $(cat create_resp.json)"
+            exit 1
+          fi
+          echo "pr_number=$NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Build rich PR body and update PR title (include PR id)
+        run: |
+          PR=${{ steps.createpr.outputs.pr_number }}
+          BR="${{ steps.validate.outputs.branch }}"
+          # fetch changed files from git diff
+          FILES=$(git diff --name-only origin/dev origin/"$BR")
+          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
+          LAST_MSG=$(git log -1 --pretty=%B origin/"$BR")
+          COMMITS=$(git log --pretty=format:"%h %s" origin/dev..origin/"$BR")
+          # PR title include PR id
+          NEW_TITLE="Promote ${BR} → dev PR ID#${PR}"
+          # PR body
+          BODY="PR ID: ${PR}\n\nThis PR promotes changes from branch: ${BR} into dev.\n\nChanges identified: ${COUNT} file(s)\n\nFiles:\n$(echo \"$FILES\" | sed 's/^/ - /')\n\nCommit message (latest):\n${LAST_MSG}\n\nCommits:\n${COMMITS}\n\n(Use this PR ID as input when promoting dev → uat.)"
+          PAYLOAD=$(jq -n --arg title "$NEW_TITLE" --arg body "$BODY" '{title:$title, body:$body}')
+          RESP=$(curl -s -X PATCH -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "https://api.github.com/repos/${{ github.repository }}/pulls/$PR")
+          echo "Updated PR: $(echo $RESP | jq -r .html_url)"

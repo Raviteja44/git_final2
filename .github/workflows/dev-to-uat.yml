@@ -1,0 +1,122 @@
+name: 2. Dev → UAT Promotion (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number that was merged into dev (source PR to promote)"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Checkout full repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify PR was merged into dev
+        id: verify_pr
+        run: |
+          PR=${{ github.event.inputs.pr_number }}
+          REPO="${{ github.repository }}"
+          PR_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/$REPO/pulls/$PR")
+          merged=$(echo "$PR_JSON" | jq -r .merged)
+          base=$(echo "$PR_JSON" | jq -r .base.ref)
+          if [ "$merged" != "true" ]; then
+            echo "ERROR: PR #$PR is not merged. merged=$merged"
+            echo "$PR_JSON" > pr-debug.json
+            exit 1
+          fi
+          if [ "$base" != "dev" ]; then
+            echo "ERROR: PR #$PR base is '$base' but must be 'dev'."
+            echo "$PR_JSON" > pr-debug.json
+            exit 1
+          fi
+          echo "$PR_JSON" > pr-$PR.json
+          echo "ok=true" >> $GITHUB_OUTPUT
+
+      - name: Get PR files and summary
+        id: prfiles
+        run: |
+          PR=${{ github.event.inputs.pr_number }}
+          REPO="${{ github.repository }}"
+          # pull list of files (may be paginated; we assume reasonably small PRs)
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/$REPO/pulls/$PR/files" > prfiles.json
+          FILES=$(jq -r '.[].filename' prfiles.json | sed '/^$/d')
+          COUNT=$(jq -r 'length' prfiles.json)
+          # get last commit message from PR (use commits API)
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/$REPO/pulls/$PR/commits" > prcommits.json
+          LAST_MSG=$(jq -r '.[-1].commit.message' prcommits.json)
+          COMMITS=$(jq -r '.[] | "\(.sha[0:7]) \(.commit.message)"' prcommits.json)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "last_msg<<EOF" >> $GITHUB_OUTPUT
+          echo "$LAST_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "commits<<'EOF'" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Fetch PR diff (raw .diff)
+        run: |
+          PR=${{ github.event.inputs.pr_number }}
+          REPO="${{ github.repository }}"
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/$REPO/pulls/$PR" > pr-${PR}.diff
+
+      - name: Create temporary branch from uat
+        id: branch
+        run: |
+          TIMESTAMP=$(date +%s)
+          PRNUM=${{ github.event.inputs.pr_number }}
+          TMP="promote-pr-${PRNUM}-${TIMESTAMP}"
+          git fetch origin uat --depth=1
+          git checkout -b $TMP origin/uat
+          git push origin $TMP
+          echo "tmp_branch=$TMP" >> $GITHUB_OUTPUT
+
+      - name: Apply diff onto tmp branch and push
+        run: |
+          PR=${{ github.event.inputs.pr_number }}
+          TMP=${{ steps.branch.outputs.tmp_branch }}
+          set -e
+          git apply --index pr-${PR}.diff || (echo "git apply failed; there may be conflicts" && exit 1)
+          git add -A
+          # commit using info from PR
+          LASTMSG="${{ steps.prfiles.outputs.last_msg }}"
+          git commit -m "Promote PR #${PR} to uat" -m "${LASTMSG}"
+          git push origin HEAD:${TMP}
+
+      - name: Create PR into uat with rich body
+        run: |
+          PR=${{ github.event.inputs.pr_number }}
+          TMP=${{ steps.branch.outputs.tmp_branch }}
+          REPO="${{ github.repository }}"
+          TITLE="Promote dev → uat PR ID#${PR}"
+          BODY="PR ID: ${PR}\n\nThis PR promotes the changes (merged into dev) into uat.\n\nChanges identified: ${{ steps.prfiles.outputs.count }} file(s)\n\nFiles:\n$(echo \"${{ steps.prfiles.outputs.files }}\" | sed 's/^/ - /')\n\nCommit message (latest):\n${{ steps.prfiles.outputs.last_msg }}\n\nCommits:\n${{ steps.prfiles.outputs.commits }}\n\n(Use this PR ID when promoting uat → prod.)"
+          PAYLOAD=$(jq -n --arg title "$TITLE" --arg head "$TMP" --arg base "uat" --arg body "$BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+          RESP=$(curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" -d "$PAYLOAD" "https://api.github.com/repos/$REPO/pulls")
+          echo "create_resp: $RESP"
+          echo "$RESP" | jq -r .html_url
