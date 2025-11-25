@@ -1,10 +1,10 @@
-name: 1. Promote feature → dev
+name: 1. Feature → Dev Promotion
 
 on:
   workflow_dispatch:
     inputs:
       feature_branch:
-        description: "Name of feature branch (example: feature/edp_changes_ravi)"
+        description: "Name of the feature branch to promote"
         required: true
         type: string
 
@@ -13,89 +13,47 @@ permissions:
   pull-requests: write
 
 jobs:
-  promote:
+  create-pr:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout (needed for compare API auth)
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Checkout dev and feature branches
         uses: actions/checkout@v4
-
-      - name: Validate and Create PR
-        uses: actions/github-script@v6
         with:
-          script: |
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
+          fetch-depth: 0
+          ref: dev
 
-            const feature = context.payload.inputs.feature_branch.trim();
-            const base = "dev";
+      - name: Fetch feature branch
+        run: |
+          git fetch origin ${{ github.event.inputs.feature_branch }}
 
-            if (!feature) {
-              core.setFailed("ERROR: Feature branch is empty.");
-              return;
-            }
+      - name: Calculate diff exists?
+        run: |
+          git diff --quiet origin/dev origin/${{ github.event.inputs.feature_branch }} || echo "has_diff=true" >> $GITHUB_ENV
 
-            // 1️⃣ Validate branch exists
-            try {
-              await github.rest.repos.getBranch({ owner, repo, branch: feature });
-            } catch (err) {
-              core.setFailed(`ERROR: Branch '${feature}' does not exist.`);
-              return;
-            }
+      - name: Stop if no diff
+        if: env.has_diff != 'true'
+        run: |
+          echo "No differences found. PR not required."
+          exit 1
 
-            // 2️⃣ Use merge-base safe comparison (handles diverged histories)
-            const basehead = `${feature}...${base}`;
+      - name: Create PR (feature → dev)
+        run: |
+          BRANCH="${{ github.event.inputs.feature_branch }}"
+          TITLE="Promote ${BRANCH} → dev"
+          BODY="Automated PR to promote ${BRANCH} into dev."
 
-            const compare = await github.rest.repos.compareCommitsWithBasehead({
-              owner,
-              repo,
-              basehead
-            });
+          PAYLOAD=$(jq -n --arg title "$TITLE" --arg head "$BRANCH" --arg base "dev" --arg body "$BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}')
 
-            const files = compare.files || [];
-            const commits = compare.commits || [];
+          RESP=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
 
-            // 3️⃣ Filter: Only show commits unique to FEATURE branch
-            const featureCommits = commits.filter(c => {
-              return c.parents && c.parents.length === 1;   // not merge commits
-            });
-
-            if (files.length === 0 && featureCommits.length === 0) {
-              core.setFailed(`❌ No differences found between '${feature}' and '${base}'.`);
-              return;
-            }
-
-            const fileNames = files.map(f => f.filename);
-            const commitMessages = featureCommits
-              .map(c => `- ${c.commit.message.split("\n")[0]} (${c.sha.substring(0, 7)})`)
-              .join("\n");
-
-            // 4️⃣ PR title & body
-            const title = `Promote ${feature} → ${base}`;
-
-            const body = [
-              "**Automated Promotion PR**",
-              "",
-              `**Source branch:** ${feature}`,
-              `**Target branch:** ${base}`,
-              "",
-              `**Changed files:** ${files.length}`,
-              "",
-              "### File list",
-              fileNames.join("\n"),
-              "",
-              "### Feature branch commit messages",
-              commitMessages || "(none)",
-            ].join("\n");
-
-            // 5️⃣ Create PR
-            const pr = await github.rest.pulls.create({
-              owner,
-              repo,
-              base,
-              head: feature,
-              title,
-              body
-            });
-
-            core.info(`Created PR #${pr.data.number}: ${pr.data.html_url}`);
+          echo "Response: $RESP"
