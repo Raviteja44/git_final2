@@ -1,12 +1,22 @@
-name: 3. UAT → Prod Promotion (manual)
+name: 3. Promote uat → prod (by PR id)
 
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: "PR number that was merged into uat (source PR to promote to prod)"
+      source_pr:
+        description: 'PR number that merged dev → uat (e.g. 42)'
         required: true
         type: number
+      temp_branch_prefix:
+        description: 'Temp branch prefix (optional)'
+        required: false
+        default: 'temp/promote'
+        type: string
+      enable_auto_merge:
+        description: 'Enable auto-merge when approvals satisfied? (true/false)'
+        required: false
+        default: 'true'
+        type: string
 
 permissions:
   contents: write
@@ -16,102 +26,107 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Checkout full repo
-        uses: actions/checkout@v4
+      - name: Setup node
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: '18'
 
-      - name: Verify PR was merged into uat
-        id: verify_pr
-        run: |
-          PR=${{ github.event.inputs.pr_number }}
-          REPO="${{ github.repository }}"
-          PR_JSON=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/$REPO/pulls/$PR")
-          merged=$(echo "$PR_JSON" | jq -r .merged)
-          base=$(echo "$PR_JSON" | jq -r .base.ref)
-          if [ "$merged" != "true" ]; then
-            echo "ERROR: PR #$PR is not merged. merged=$merged"
-            exit 1
-          fi
-          if [ "$base" != "uat" ]; then
-            echo "ERROR: PR #$PR base is '$base' but must be 'uat'."
-            exit 1
-          fi
-          echo "$PR_JSON" > pr-$PR.json
-          echo "ok=true" >> $GITHUB_OUTPUT
+      - name: Create temp branch at last commit of source PR and open PR → prod
+        uses: actions/github-script@v6
+        id: create_pr
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt(core.getInput('source_pr'), 10);
+            const prefix = core.getInput('temp_branch_prefix') || 'temp/promote';
+            const enableAuto = core.getInput('enable_auto_merge') === 'true';
 
-      - name: Get PR files & commits
-        id: prfiles
-        run: |
-          PR=${{ github.event.inputs.pr_number }}
-          REPO="${{ github.repository }}"
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/$REPO/pulls/$PR/files" > prfiles.json
-          FILES=$(jq -r '.[].filename' prfiles.json | sed '/^$/d')
-          COUNT=$(jq -r 'length' prfiles.json)
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/$REPO/pulls/$PR/commits" > prcommits.json
-          LAST_MSG=$(jq -r '.[-1].commit.message' prcommits.json)
-          COMMITS=$(jq -r '.[] | "\(.sha[0:7]) \(.commit.message)"' prcommits.json)
-          echo "files<<EOF" >> $GITHUB_OUTPUT
-          echo "$FILES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "last_msg<<EOF" >> $GITHUB_OUTPUT
-          echo "$LAST_MSG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "commits<<'EOF'" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+            // fetch commits of the source PR
+            const commitsResp = await github.rest.pulls.listCommits({
+              owner, repo, pull_number: prNumber,
+              per_page: 300
+            });
 
-      - name: Fetch PR diff
-        run: |
-          PR=${{ github.event.inputs.pr_number }}
-          REPO="${{ github.repository }}"
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3.diff" \
-            "https://api.github.com/repos/$REPO/pulls/$PR" > pr-${PR}.diff
+            if (!commitsResp.data || commitsResp.data.length === 0) {
+              core.setFailed(`No commits found in PR #${prNumber}`);
+              return;
+            }
 
-      - name: Create temporary branch from prod
-        id: branch
-        run: |
-          TIMESTAMP=$(date +%s)
-          PRNUM=${{ github.event.inputs.pr_number }}
-          TMP="promote-pr-${PRNUM}-${TIMESTAMP}"
-          git fetch origin prod --depth=1
-          git checkout -b $TMP origin/prod
-          git push origin $TMP
-          echo "tmp_branch=$TMP" >> $GITHUB_OUTPUT
+            const lastCommit = commitsResp.data[commitsResp.data.length - 1];
+            const lastSha = lastCommit.sha;
+            const sanitized = `promote-pr-${prNumber}`.replace(/[^a-zA-Z0-9-_./]/g, '-');
+            const refName = `refs/heads/${prefix}/${sanitized}`;
 
-      - name: Apply diff onto tmp branch and push
-        run: |
-          PR=${{ github.event.inputs.pr_number }}
-          TMP=${{ steps.branch.outputs.tmp_branch }}
-          set -e
-          git apply --index pr-${PR}.diff || (echo "git apply failed; there may be conflicts" && exit 1)
-          git add -A
-          LASTMSG="${{ steps.prfiles.outputs.last_msg }}"
-          git commit -m "Promote PR #${PR} to prod" -m "${LASTMSG}"
-          git push origin HEAD:${TMP}
+            try {
+              await github.rest.git.createRef({
+                owner, repo,
+                ref: refName,
+                sha: lastSha
+              });
+            } catch (err) {
+              if (err.status === 422) {
+                await github.rest.git.updateRef({
+                  owner, repo,
+                  ref: refName.replace('refs/heads/', ''),
+                  sha: lastSha,
+                  force: true
+                });
+              } else {
+                throw err;
+              }
+            }
 
-      - name: Create PR into prod with rich body
-        run: |
-          PR=${{ github.event.inputs.pr_number }}
-          TMP=${{ steps.branch.outputs.tmp_branch }}
-          REPO="${{ github.repository }}"
-          TITLE="Promote uat → prod PR ID#${PR}"
-          BODY="PR ID: ${PR}\n\nThis PR promotes the changes (merged into uat) into prod.\n\nChanges identified: ${{ steps.prfiles.outputs.count }} file(s)\n\nFiles:\n$(echo \"${{ steps.prfiles.outputs.files }}\" | sed 's/^/ - /')\n\nCommit message (latest):\n${{ steps.prfiles.outputs.last_msg }}\n\nCommits:\n${{ steps.prfiles.outputs.commits }}\n\n(Reference: the PR number above describes what was tested in uat.)"
-          PAYLOAD=$(jq -n --arg title "$TITLE" --arg head "$TMP" --arg base "prod" --arg body "$BODY" \
-            '{title:$title, head:$head, base:$base, body:$body}')
-          RESP=$(curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" -d "$PAYLOAD" "https://api.github.com/repos/$REPO/pulls")
-          echo "create_resp: $RESP"
-          echo "$RESP" | jq -r .html_url
+            const base = 'prod';
+            const head = `${prefix}/${sanitized}`;
+
+            const compare = await github.rest.repos.compareCommits({
+              owner, repo,
+              base,
+              head
+            });
+
+            const files = compare.files || [];
+            const fileCount = files.length;
+            const fileNames = files.slice(0,200).map(f => f.filename);
+            const commitMessages = commitsResp.data.map(c => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0,7)})`).join('\n');
+
+            const title = `Promote ${head} → ${base} (PR #${prNumber})`;
+            const body = [
+              `**PR created by workflow**`,
+              ``,
+              `**Derived from source PR:** #${prNumber}`,
+              `**Source last commit:** ${lastSha}`,
+              `**Target branch:** ${base}`,
+              `**Changes identified:** ${fileCount} files`,
+              ``,
+              `**Changed files (first 200):**`,
+              fileNames.length ? fileNames.join('\n') : '(none)',
+              ``,
+              `**Commits from source PR:**`,
+              commitMessages || '(none)',
+            ].join('\n');
+
+            const pr = await github.rest.pulls.create({
+              owner, repo,
+              head,
+              base,
+              title,
+              body,
+            });
+
+            core.setOutput('pr_number', pr.data.number);
+            core.setOutput('pr_url', pr.data.html_url);
+
+            if (enableAuto) {
+              try {
+                await github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/enable-auto-merge', {
+                  owner, repo, pull_number: pr.data.number,
+                  mediaType: { previews: ['luke-cage-preview'] },
+                  merge_method: 'merge'
+                });
+                core.info('Auto-merge enabled on PR #' + pr.data.number);
+              } catch (err) {
+                core.warning('Failed to enable auto-merge: ' + err.message);
+              }
+            }
