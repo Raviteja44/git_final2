@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       feature_branch:
-        description: "Feature branch name (example: feature/edp_changes_ravi)"
+        description: "Name of feature branch (example: feature/edp_changes_ravi)"
         required: true
         type: string
 
@@ -17,59 +17,60 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "18"
+      - name: Checkout (needed for compare API auth)
+        uses: actions/checkout@v4
 
-      - name: Validate inputs and create PR
+      - name: Validate and Create PR
         uses: actions/github-script@v6
         with:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            // Read workflow_dispatch input properly
-            const feature = context.payload.inputs.feature_branch;
+            const feature = context.payload.inputs.feature_branch.trim();
             const base = "dev";
 
-            // Validate input
-            if (!feature || feature.trim() === "") {
-              core.setFailed("ERROR: Input 'feature_branch' is empty.");
+            if (!feature) {
+              core.setFailed("ERROR: Feature branch is empty.");
               return;
             }
 
-            // Validate that branch exists
+            // 1️⃣ Validate branch exists
             try {
               await github.rest.repos.getBranch({ owner, repo, branch: feature });
             } catch (err) {
-              core.setFailed(`ERROR: Branch '${feature}' does not exist in the repository.`);
+              core.setFailed(`ERROR: Branch '${feature}' does not exist.`);
               return;
             }
 
-            // Compare feature vs dev
-            const compare = await github.rest.repos.compareCommits({
-              owner, repo,
-              base: base,
-              head: feature
+            // 2️⃣ Use merge-base safe comparison (handles diverged histories)
+            const basehead = `${feature}...${base}`;
+
+            const compare = await github.rest.repos.compareCommitsWithBasehead({
+              owner,
+              repo,
+              basehead
             });
 
             const files = compare.files || [];
             const commits = compare.commits || [];
 
-            if (files.length === 0 && commits.length === 0) {
-              core.setFailed(`No differences found between '${base}' and '${feature}'.`);
+            // 3️⃣ Filter: Only show commits unique to FEATURE branch
+            const featureCommits = commits.filter(c => {
+              return c.parents && c.parents.length === 1;   // not merge commits
+            });
+
+            if (files.length === 0 && featureCommits.length === 0) {
+              core.setFailed(`❌ No differences found between '${feature}' and '${base}'.`);
               return;
             }
 
-            const fileNames = files.slice(0, 200).map(f => f.filename);
-            const commitMessages = commits.map(
-              c => `- ${c.commit.message.split("\n")[0]} (${c.sha.substring(0,7)})`
-            ).join("\n");
+            const fileNames = files.map(f => f.filename);
+            const commitMessages = featureCommits
+              .map(c => `- ${c.commit.message.split("\n")[0]} (${c.sha.substring(0, 7)})`)
+              .join("\n");
 
-            const lastCommit = commits.length ? commits[commits.length - 1] : null;
-            const commitSha = lastCommit ? lastCommit.sha : "(none)";
-
+            // 4️⃣ PR title & body
             const title = `Promote ${feature} → ${base}`;
 
             const body = [
@@ -77,18 +78,17 @@ jobs:
               "",
               `**Source branch:** ${feature}`,
               `**Target branch:** ${base}`,
+              "",
               `**Changed files:** ${files.length}`,
               "",
-              "### File list (first 200)",
+              "### File list",
               fileNames.join("\n"),
               "",
-              "### Commit messages",
-              commitMessages,
-              "",
-              `**Last commit SHA:** ${commitSha}`
+              "### Feature branch commit messages",
+              commitMessages || "(none)",
             ].join("\n");
 
-            // Create a PR
+            // 5️⃣ Create PR
             const pr = await github.rest.pulls.create({
               owner,
               repo,
