@@ -1,18 +1,9 @@
-name: 4. Cleanup temp promote branches
+name: 4. Cleanup Temp Branches
 
 on:
+  schedule:
+    - cron: "*/3 * * * *"   # every 3 minutes
   workflow_dispatch:
-    inputs:
-      prefix:
-        description: 'Branch prefix to remove (regex or prefix). E.g. temp/promote'
-        required: false
-        default: 'temp/promote'
-        type: string
-      keep_last_n:
-        description: 'Number of most recent branches to keep (by commit date). Use 0 to delete all.'
-        required: false
-        default: '0'
-        type: integer
 
 permissions:
   contents: write
@@ -21,61 +12,29 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
+      - name: Get branches
+        run: |
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/branches \
+            > branches.json
 
-      - name: Find & delete branches matching prefix (but not feature/*)
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const prefix = core.getInput('prefix') || 'temp/promote';
-            const keepN = parseInt(core.getInput('keep_last_n') || '0', 10);
+      - name: Delete temp branches
+      # (unchanged)
+        run: |
+          cat branches.json | jq -r '.[].name' | while read BRANCH; do
 
-            // List refs heads (paginated)
-            let branches = [];
-            let page = 1;
-            while (true) {
-              const resp = await github.rest.repos.listBranches({
-                owner, repo, per_page: 100, page
-              });
-              branches = branches.concat(resp.data);
-              if (resp.data.length < 100) break;
-              page++;
-            }
+            if [[ "$BRANCH" == "dev" ]] || \
+               [[ "$BRANCH" == "uat" ]] || \
+               [[ "$BRANCH" == "prod" ]] || \
+               [[ "$BRANCH" == feature/* ]]; then
+              continue
+            fi
 
-            // Filter branches that start with prefix and do not start with feature/
-            const candidates = branches.filter(b => {
-              const name = b.name;
-              return name.startsWith(prefix) && !name.startsWith('feature/');
-            });
+            if [[ "$BRANCH" == promote-pr-* ]]; then
+              echo "Deleting $BRANCH..."
+              curl -s -X DELETE \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                https://api.github.com/repos/${{ github.repository }}/git/refs/heads/$BRANCH
+            fi
 
-            // sort by commit date descending (most recent first)
-            candidates.sort((a,b) => {
-              const ad = new Date(a.commit.committer?.date || a.commit.commit.committer?.date || 0).getTime();
-              const bd = new Date(b.commit.committer?.date || b.commit.commit.committer?.date || 0).getTime();
-              return bd - ad;
-            });
-
-            // if keepN > 0, skip the first keepN branches
-            const toDelete = keepN > 0 ? candidates.slice(keepN) : candidates;
-
-            if (toDelete.length === 0) {
-              core.info('No temp branches found to delete.');
-            } else {
-              for (const b of toDelete) {
-                const ref = `heads/${b.name}`;
-                try {
-                  await github.rest.git.deleteRef({
-                    owner, repo,
-                    ref
-                  });
-                  core.info(`Deleted branch: ${b.name}`);
-                } catch (err) {
-                  core.warning(`Failed to delete ${b.name}: ${err.message}`);
-                }
-              }
-            }
+          done
