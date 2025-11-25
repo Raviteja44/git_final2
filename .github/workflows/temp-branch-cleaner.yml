@@ -1,9 +1,18 @@
-name: 4. Cleanup Temp Promotion Branches
+name: 4. Cleanup temp promote branches
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 2 * * *"  
+    inputs:
+      prefix:
+        description: 'Branch prefix to remove (regex or prefix). E.g. temp/promote'
+        required: false
+        default: 'temp/promote'
+        type: string
+      keep_last_n:
+        description: 'Number of most recent branches to keep (by commit date). Use 0 to delete all.'
+        required: false
+        default: '0'
+        type: integer
 
 permissions:
   contents: write
@@ -12,34 +21,61 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-      - name: Get all branches (first 100)
-        id: branches
-        run: |
-          REPO="${{ github.repository }}"
-          # get branches (first 100; for larger repos you can iterate with pagination)
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/$REPO/branches?per_page=100" > branches.json
-          jq -r '.[].name' branches.json | sort > all_branches.txt
-          echo "::set-output name=file::all_branches.txt"
+      - name: Find & delete branches matching prefix (but not feature/*)
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prefix = core.getInput('prefix') || 'temp/promote';
+            const keepN = parseInt(core.getInput('keep_last_n') || '0', 10);
 
-      - name: Delete promote-pr-* branches (but keep feature/* and protected)
-        run: |
-          REPO="${{ github.repository }}"
-          while read BR; do
-            if [[ "$BR" == promote-pr-* ]]; then
-              # safety: skip feature/* (shouldn't match) and major branches
-              if [[ "$BR" == "dev" ]] || [[ "$BR" == "uat" ]] || [[ "$BR" == "prod" ]]; then
-                echo "Skipping protected branch $BR"
-                continue
-              fi
-              echo "Deleting branch $BR"
-              # Delete the ref
-              curl -s -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/$REPO/git/refs/heads/$BR" || echo "Could not delete $BR"
-            fi
-          done < all_branches.txt
+            // List refs heads (paginated)
+            let branches = [];
+            let page = 1;
+            while (true) {
+              const resp = await github.rest.repos.listBranches({
+                owner, repo, per_page: 100, page
+              });
+              branches = branches.concat(resp.data);
+              if (resp.data.length < 100) break;
+              page++;
+            }
+
+            // Filter branches that start with prefix and do not start with feature/
+            const candidates = branches.filter(b => {
+              const name = b.name;
+              return name.startsWith(prefix) && !name.startsWith('feature/');
+            });
+
+            // sort by commit date descending (most recent first)
+            candidates.sort((a,b) => {
+              const ad = new Date(a.commit.committer?.date || a.commit.commit.committer?.date || 0).getTime();
+              const bd = new Date(b.commit.committer?.date || b.commit.commit.committer?.date || 0).getTime();
+              return bd - ad;
+            });
+
+            // if keepN > 0, skip the first keepN branches
+            const toDelete = keepN > 0 ? candidates.slice(keepN) : candidates;
+
+            if (toDelete.length === 0) {
+              core.info('No temp branches found to delete.');
+            } else {
+              for (const b of toDelete) {
+                const ref = `heads/${b.name}`;
+                try {
+                  await github.rest.git.deleteRef({
+                    owner, repo,
+                    ref
+                  });
+                  core.info(`Deleted branch: ${b.name}`);
+                } catch (err) {
+                  core.warning(`Failed to delete ${b.name}: ${err.message}`);
+                }
+              }
+            }

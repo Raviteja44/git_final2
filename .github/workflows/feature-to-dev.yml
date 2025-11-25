@@ -1,112 +1,105 @@
-name: 1. Feature → Dev (manual)
+name: 1. Promote feature → dev
 
 on:
   workflow_dispatch:
     inputs:
       feature_branch:
-        description: "Feature branch name (must start with 'feature/')"
+        description: 'Feature branch name (e.g. feature/edp_changes_ravi)'
         required: true
+        type: string
+      enable_auto_merge:
+        description: 'Enable auto-merge when approvals satisfied? (true/false)'
+        required: false
+        default: 'true'
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write       # for creating refs, comparing commits
+  pull-requests: write  # for creating PRs and enabling auto-merge
 
 jobs:
-  create-pr:
+  promote:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup tools
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+      - name: Setup node (for github-script)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-      - name: Validate feature branch input
-        id: validate
-        run: |
-          BR="${{ github.event.inputs.feature_branch }}"
-          if [[ "$BR" != feature/* ]]; then
-            echo "ERROR: feature_branch must start with 'feature/'. Got: $BR"
-            exit 1
-          fi
-          # verify remote branch exists
-          if ! git ls-remote --heads origin "$BR" | grep -q "refs/heads/"; then
-            echo "ERROR: Branch origin/$BR not found."
-            exit 1
-          fi
-          echo "branch=$BR" >> $GITHUB_OUTPUT
+      - name: Create PR from feature → dev (compare and include file list)
+        uses: actions/github-script@v6
+        id: create_pr
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const feature = core.getInput('feature_branch');
+            const base = 'dev';
+            const enableAuto = core.getInput('enable_auto_merge') === 'true';
 
-      - name: Fetch branches
-        run: |
-          git fetch --no-tags --prune --depth=1 origin dev
-          git fetch --no-tags --prune --depth=1 origin "${{ steps.validate.outputs.branch }}"
+            // 1) Compare dev...feature to get changed files & commit messages
+            const compare = await github.rest.repos.compareCommits({
+              owner, repo,
+              base: base,
+              head: feature
+            });
 
-      - name: Check for diffs vs dev
-        id: diffcheck
-        run: |
-          BR="${{ steps.validate.outputs.branch }}"
-          # list changed files between origin/dev and feature branch
-          FILES=$(git diff --name-only origin/dev origin/"$BR")
-          if [ -z "$FILES" ]; then
-            echo "No differences found between origin/dev and origin/$BR"
-            exit 1
-          fi
-          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
-          echo "files=$FILES" > files.txt
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "files_count=$COUNT" >> $GITHUB_OUTPUT
+            if (compare.status === 'diverged' || compare.status === 'ahead' || compare.files?.length > 0) {
+              const files = compare.files || [];
+              const fileCount = files.length;
+              const fileNames = files.slice(0, 200).map(f => f.filename); // limit to 200 names
+              const commits = compare.commits || [];
+              const lastCommit = commits.length ? commits[commits.length - 1] : null;
+              const commitSha = lastCommit ? lastCommit.sha : '';
+              const commitMessages = commits.map(c => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0,7)})`).join('\n');
 
-      - name: Get latest commit message(s) from feature branch
-        id: commits
-        run: |
-          BR="${{ steps.validate.outputs.branch }}"
-          # get last commit summary from branch
-          LAST_MSG=$(git log -1 --pretty=%B origin/"$BR")
-          # also capture list of commits (short) that make up the feature branch vs dev
-          COMMITS=$(git log --pretty=format:"%h %s" origin/dev..origin/"$BR")
-          echo "last_msg<<EOF" >> $GITHUB_OUTPUT
-          echo "$LAST_MSG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "commits<<'EOF'" >> $GITHUB_OUTPUT
-          echo "$COMMITS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+              // PR title & body
+              const sanitizedFeature = feature.replace(/\//g, '_');
+              const title = `Promote ${feature} → ${base}`;
+              const body = [
+                `**PR created by workflow**`,
+                ``,
+                `**Source branch:** ${feature}`,
+                `**Target branch:** ${base}`,
+                `**Changes identified:** ${fileCount} files`,
+                ``,
+                `**Changed files (first 200 shown):**`,
+                fileNames.length ? fileNames.join('\n') : '(none)',
+                ``,
+                `**Commits in this change:**`,
+                commitMessages || '(none)',
+                ``,
+                `**Last commit SHA:** ${commitSha}`,
+                ``,
+                `**Notes:** This PR was created automatically by workflow \`feature-to-dev\`.`,
+              ].join('\n');
 
-      - name: Create PR (feature → dev)
-        id: createpr
-        run: |
-          BR="${{ steps.validate.outputs.branch }}"
-          TITLE="Promote ${BR} → dev"
-          BODY="Automated PR to promote ${BR} into dev."
-          PAYLOAD=$(jq -n --arg title "$TITLE" --arg head "$BR" --arg base "dev" --arg body "$BODY" \
-            '{title:$title, head:$head, base:$base, body:$body}')
-          RESP=$(curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" "https://api.github.com/repos/${{ github.repository }}/pulls")
-          echo "$RESP" > create_resp.json
-          NUMBER=$(jq -r .number create_resp.json)
-          if [ "$NUMBER" = "null" ] || [ -z "$NUMBER" ]; then
-            echo "Failed to create PR: $(cat create_resp.json)"
-            exit 1
-          fi
-          echo "pr_number=$NUMBER" >> $GITHUB_OUTPUT
+              // Create PR
+              const pr = await github.rest.pulls.create({
+                owner, repo,
+                title,
+                head: feature,
+                base: base,
+                body,
+              });
 
-      - name: Build rich PR body and update PR title (include PR id)
-        run: |
-          PR=${{ steps.createpr.outputs.pr_number }}
-          BR="${{ steps.validate.outputs.branch }}"
-          # fetch changed files from git diff
-          FILES=$(git diff --name-only origin/dev origin/"$BR")
-          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
-          LAST_MSG=$(git log -1 --pretty=%B origin/"$BR")
-          COMMITS=$(git log --pretty=format:"%h %s" origin/dev..origin/"$BR")
-          # PR title include PR id
-          NEW_TITLE="Promote ${BR} → dev PR ID#${PR}"
-          # PR body
-          BODY="PR ID: ${PR}\n\nThis PR promotes changes from branch: ${BR} into dev.\n\nChanges identified: ${COUNT} file(s)\n\nFiles:\n$(echo \"$FILES\" | sed 's/^/ - /')\n\nCommit message (latest):\n${LAST_MSG}\n\nCommits:\n${COMMITS}\n\n(Use this PR ID as input when promoting dev → uat.)"
-          PAYLOAD=$(jq -n --arg title "$NEW_TITLE" --arg body "$BODY" '{title:$title, body:$body}')
-          RESP=$(curl -s -X PATCH -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" "https://api.github.com/repos/${{ github.repository }}/pulls/$PR")
-          echo "Updated PR: $(echo $RESP | jq -r .html_url)"
+              core.setOutput('pr_number', pr.data.number);
+              core.setOutput('pr_url', pr.data.html_url);
+
+              // Optionally enable auto-merge (will only merge when branch protections satisfied)
+              if (enableAuto) {
+                try {
+                  await github.request('PUT /repos/{owner}/{repo}/pulls/{pull_number}/enable-auto-merge', {
+                    owner, repo, pull_number: pr.data.number,
+                    mediaType: { previews: ['luke-cage-preview'] }, // auto-merge preview header historically used; kept safe
+                    merge_method: 'merge'
+                  });
+                  core.info('Auto-merge enabled on PR #' + pr.data.number);
+                } catch (err) {
+                  core.warning('Failed to enable auto-merge (this may be due to permissions or repo settings): ' + err.message);
+                }
+              }
+
+            } else {
+              core.setFailed(`No differences found between ${base} and ${feature}. Nothing to promote.`);
+            }
